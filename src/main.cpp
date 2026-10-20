@@ -1,100 +1,99 @@
-/**
- * Include the Geode headers.
- */
 #include <Geode/Geode.hpp>
+#include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
+#include <deque>
 
-/**
- * Brings cocos2d and all Geode namespaces to the current scope.
- */
 using namespace geode::prelude;
 
-/**
- * `$modify` lets you extend and modify GD's classes.
- * To hook a function in Geode, simply $modify the class
- * and write a new function definition with the signature of
- * the function you want to hook.
- *
- * Here we use the overloaded `$modify` macro to set our own class name,
- * so that we can use it for button callbacks.
- *
- * Notice the header being included, you *must* include the header for
- * the class you are modifying, or you will get a compile error.
- *
- * Another way you could do this is like this:
- *
- * struct MyMenuLayer : Modify<MyMenuLayer, MenuLayer> {};
- */
-#include <Geode/modify/MenuLayer.hpp>
-class $modify(MyMenuLayer, MenuLayer) {
-	/**
-	 * Typically classes in GD are initialized using the `init` function, (though not always!),
-	 * so here we use it to add our own button to the bottom menu.
-	 *
-	 * Note that for all hooks, your signature has to *match exactly*,
-	 * `void init()` would not place a hook!
-	*/
-	bool init() {
-		/**
-		 * We call the original init function so that the
-		 * original class is properly initialized.
-		 */
-		if (!MenuLayer::init()) {
-			return false;
-		}
+struct Snap {
+    int frame;
+    CheckpointObject* cp;
+};
 
-		/**
-		 * You can use methods from the `geode::log` namespace to log messages to the console,
-		 * being useful for debugging and such. See this page for more info about logging:
-		 * https://docs.geode-sdk.org/tutorials/logging
-		*/
-		log::debug("Hello from my MenuLayer::init hook! This layer has {} children.", this->getChildrenCount());
+class $modify(GraceBase, GJBaseGameLayer) {
+    struct Fields {
+        int frame = 0;
+        int lastClickFrame = -1;
+        bool simulating = false;
+    };
 
-		/**
-		 * See this page for more info about buttons
-		 * https://docs.geode-sdk.org/tutorials/buttons
-		*/
-		auto myButton = CCMenuItemSpriteExtra::create(
-			CCSprite::createWithSpriteFrameName("GJ_likeBtn_001.png"),
-			this,
-			/**
-			 * Here we use the name we set earlier for our modify class.
-			*/
-			menu_selector(MyMenuLayer::onMyButton)
-		);
+    // NOTE: signature varies between GD versions, check your bindings
+    void handleButton(bool down, int button, bool isPlayer1) {
+        if (down && !m_fields->simulating) m_fields->lastClickFrame = m_fields->frame;
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
+};
 
-		/**
-		 * Here we access the `bottom-menu` node by its ID, and add our button to it.
-		 * Node IDs are a Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/nodetree
-		*/
-		auto menu = this->getChildByID("bottom-menu");
-		menu->addChild(myButton);
+class $modify(GracePlayLayer, PlayLayer) {
+    struct Fields {
+        std::deque<Snap> snaps;
+        bool diedInSim = false;
+        bool retrying = false;
+    };
 
-		/**
-		 * The `_spr` string literal operator just prefixes the string with
-		 * your mod id followed by a slash. This is good practice for setting your own node ids.
-		*/
-		myButton->setID("my-button"_spr);
+    void update(float dt) {
+        auto f = static_cast<GraceBase*>(static_cast<GJBaseGameLayer*>(this));
+        int grace = Mod::get()->getSettingValue<int64_t>("grace-frames");
 
-		/**
-		 * We update the layout of the menu to ensure that our button is properly placed.
-		 * This is yet another Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/layouts
-		*/
-		menu->updateLayout();
+        if (Mod::get()->getSettingValue<bool>("enabled") && grace > 0
+            && !m_fields->retrying && !m_player1->m_isDead) {
+            auto cp = this->createCheckpoint();
+            cp->retain();
+            m_fields->snaps.push_back({ f->m_fields->frame, cp });
+            while ((int)m_fields->snaps.size() > grace * 2 + 2) {
+                m_fields->snaps.front().cp->release();
+                m_fields->snaps.pop_front();
+            }
+        }
+        f->m_fields->frame++;
+        PlayLayer::update(dt);
+    }
 
-		/**
-		 * We return `true` to indicate that the class was properly initialized.
-		 */
-		return true;
-	}
+    void destroyPlayer(PlayerObject* p, GameObject* obj) {
+        if (m_fields->retrying) {            // death during a dry run
+            m_fields->diedInSim = true;
+            return;
+        }
+        if (Mod::get()->getSettingValue<bool>("enabled") && tryCorrect()) return;
+        PlayLayer::destroyPlayer(p, obj);
+    }
 
-	/**
-	 * This is the callback function for the button we created earlier.
-	 * The signature for button callbacks must always be the same,
-	 * return type `void` and taking a `CCObject*`.
-	*/
-	void onMyButton(CCObject*) {
-		FLAlertLayer::create("Geode", "Hello from my custom mod!", "OK")->show();
-	}
+    bool tryCorrect() {
+        auto f = static_cast<GraceBase*>(static_cast<GJBaseGameLayer*>(this));
+        int grace = Mod::get()->getSettingValue<int64_t>("grace-frames");
+        int click = f->m_fields->lastClickFrame;
+        int now = f->m_fields->frame;
+        if (grace <= 0 || click < 0 || now - click > grace + 2) return false;
+
+        m_fields->retrying = true;
+        f->m_fields->simulating = true;
+
+        // try clicking earlier/later by 1..grace frames
+        for (int d = 1; d <= grace; ++d) {
+            for (int sign : { -1, 1 }) {
+                int target = click + sign * d;
+                for (auto& s : m_fields->snaps) {
+                    if (s.frame != target) continue;
+                    this->loadFromCheckpoint(s.cp);
+                    m_fields->diedInSim = false;
+                    m_player1->pushButton(PlayerButton::Jump);
+                    // simulate forward past the original death point
+                    for (int i = 0; i < (now - target) + grace + 5; ++i) {
+                        if (i == 2) m_player1->releaseButton(PlayerButton::Jump);
+                        PlayLayer::update(1.f / 60.f);
+                        if (m_fields->diedInSim) break;
+                    }
+                    if (!m_fields->diedInSim) {   // found a survivable timing
+                        m_fields->retrying = false;
+                        f->m_fields->simulating = false;
+                        log::info("Saved you! ({}ﾉ´ヮ`)ﾉ*: ･ﾟ shift {}", "", sign * d);
+                        return true;
+                    }
+                }
+            }
+        }
+        m_fields->retrying = false;
+        f->m_fields->simulating = false;
+        return false;   // nothing worked, let the death happen (╥﹏╥)
+    }
 };
